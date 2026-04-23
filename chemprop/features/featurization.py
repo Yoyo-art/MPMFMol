@@ -1,17 +1,15 @@
-import os
 from argparse import Namespace
-from typing import List, Tuple, Union
+from typing import List, Union
 
 import dgl
-from rdkit import Chem
-import torch
 import numpy as np
+import torch
+from rdkit import Chem
 from rdkit.Chem import Descriptors, MACCSkeys
 from rdkit.Chem.BRICS import BreakBRICSBonds, FindBRICSBonds
-from torch import nn, LongTensor, FloatTensor
 
-# Atom feature sizes
 MAX_ATOMIC_NUM = 110
+PHARM_FEATURE_SIZE= 182
 ATOM_FEATURES = {
     'atomic_num': list(range(MAX_ATOMIC_NUM)),
     'degree': [0, 1, 2, 3, 4, 5],
@@ -26,32 +24,76 @@ ATOM_FEATURES = {
         Chem.rdchem.HybridizationType.SP3D2
     ],
 }
-PHARM_FEATURE_SIZE= 182
+ATOM_FDIM = sum(len(choices) + 1 for choices in ATOM_FEATURES.values()) + 2
+BOND_FDIM = 14
+REACT_FDIM = 34
+
 declist = Descriptors.descList
 calc = {}
 for (i,j) in declist:
     calc[i] = j
 
-# Distance feature sizes
-PATH_DISTANCE_BINS = list(range(10))
-THREE_D_DISTANCE_MAX = 20
-THREE_D_DISTANCE_STEP = 1
-THREE_D_DISTANCE_BINS = list(range(0, THREE_D_DISTANCE_MAX + 1, THREE_D_DISTANCE_STEP))
+CHARISOSMISET = {"#": 29, "%": 30, ")": 31, "(": 1, "+": 32, "-": 33, "/": 34, ".": 2,
+                 "1": 35, "0": 3, "3": 36, "2": 4, "5": 37, "4": 5, "7": 38, "6": 6,
+                 "9": 39, "8": 7, "=": 40, "A": 41, "@": 8, "C": 42, "B": 9, "E": 43,
+                 "D": 10, "G": 44, "F": 11, "I": 45, "H": 12, "K": 46, "M": 47, "L": 13,
+                 "O": 48, "N": 14, "P": 15, "S": 49, "R": 16, "U": 50, "T": 17, "W": 51,
+                 "V": 18, "Y": 52, "[": 53, "Z": 19, "]": 54, "\\": 20, "a": 55, "c": 56,
+                 "b": 21, "e": 57, "d": 22, "g": 58, "f": 23, "i": 59, "h": 24, "m": 60,
+                 "l": 25, "o": 61, "n": 26, "s": 62, "r": 27, "u": 63, "t": 28, "y": 64, "*": 65}
 
-# len(choices) + 1 to include room for uncommon values; + 2 at end for IsAromatic and mass
-ATOM_FDIM = sum(len(choices) + 1 for choices in ATOM_FEATURES.values()) + 2
-BOND_FDIM = 14
+def smiles_to_tensor(smiles_batch: List[str]) -> (torch.Tensor, torch.Tensor):
+    """
+    将SMILES批次转换为填充后的索引Tensor和掩码
 
-# Memoization
-SMILES_TO_GRAPH = {}
-REACT_FDIM = 34
-def get_react_fdim() -> int:
-    return REACT_FDIM
+    参数:
+        smiles_batch: SMILES字符串列表
+        char_to_idx: 字符到索引的映射字典
 
-def clear_cache():
-    """Clears featurization cache."""
-    global SMILES_TO_GRAPH
-    SMILES_TO_GRAPH = {}
+    返回:
+        (encoded_tensor, mask_tensor)
+        encoded_tensor: 形状为 (batch_size, max_len) 的LongTensor
+        mask_tensor: 形状为 (batch_size, max_len) 的BoolTensor (1表示有效字符)
+    """
+    # 1. 计算最大长度
+    # max_len = max(len(smiles) for smiles in smiles_batch)
+    max_len = 120
+
+    # 2. 初始化结果张量
+    batch_size = len(smiles_batch)
+    encoded_tensor = torch.zeros((batch_size, max_len), dtype=torch.long)
+    mask_tensor = torch.zeros((batch_size, max_len), dtype=torch.bool)
+
+    # 3. 填充每个SMILES
+    for i, smiles in enumerate(smiles_batch):
+        # 字符级编码
+        # encoded = [CHARISOSMISET[char] for char in smiles]
+        # encoded_tensor[i, :len(smiles)] = torch.tensor([CHARISOSMISET[char] for char in smiles])
+        # mask_tensor[i, :len(smiles)] = True  # 有效位置标记为True
+        if len(smiles)<120:
+            encoded_tensor[i, :len(smiles)] = torch.tensor([CHARISOSMISET[char] for char in smiles])
+            mask_tensor[i, :len(smiles)] = True  # 有效位置标记为True
+        else:
+            encoded_tensor[i, :max_len] = torch.tensor([CHARISOSMISET[char] for char in smiles[:120]])
+            mask_tensor[i, :len(smiles)] = True
+
+
+    # cls_id = 65
+    #
+    # # 创建 shape 为 [256, 1] 的 CLS token 矩阵
+    # cls_column = torch.full((batch_size, 1), cls_id, dtype=encoded_tensor.dtype, device=encoded_tensor.device)
+    #
+    # # 拼接在前面
+    # output_tensor = torch.cat([cls_column, encoded_tensor], dim=1)
+    #
+    # if mask_tensor.dim() == 2:
+    #     attention_mask = mask_tensor.unsqueeze(1)  # [B, L] → [B, 1, L]
+    #
+    # cls_mask = torch.ones((batch_size, 1, 1), dtype=attention_mask.dtype, device=attention_mask.device)
+    # new_attention_mask = torch.cat([cls_mask, attention_mask], dim=2)  # [B, 1, L+1]
+
+    # return encoded_tensor, attention_mask.squeeze(1), max_len
+    return encoded_tensor, mask_tensor, max_len
 
 
 def get_atom_fdim() -> int:
@@ -62,7 +104,6 @@ def get_atom_fdim() -> int:
     """
     return ATOM_FDIM
 
-
 def get_bond_fdim() -> int:
     """
     Gets the dimensionality of bond features.
@@ -71,6 +112,92 @@ def get_bond_fdim() -> int:
     """
     return BOND_FDIM
 
+def get_pharm_fdim() -> int:
+    return PHARM_FEATURE_SIZE
+
+def get_react_fdim() -> int:
+    return REACT_FDIM
+
+def maccskeys_emb(mol):
+    return list(MACCSkeys.GenMACCSKeys(mol))
+def get_PharmElement(mol_pharm):
+    atom_symbol={'C':0,'H':0,'O':0,'N':0,'P':0,
+                 'S':0,'F':0,'CL':0,'Br':0,'other':0,}
+    feat_pharm_element =[]
+    # [C,H,O,N,P,S,F,CL,Br,other]
+    for atom in mol_pharm.GetAtoms():
+        if atom.GetSymbol() in atom_symbol.keys():
+            atom_symbol[atom.GetSymbol()]+=1
+        else:
+            atom_symbol['other']+=1
+    for key,value in atom_symbol.items():
+        feat_pharm_element+=[value]
+    return feat_pharm_element
+def GetBRICSFeature(mol_pharm):
+    try:
+        pharm_feat= [calc['TPSA'](mol_pharm)*0.01]+[calc['MolLogP'](mol_pharm)]+\
+                                [calc['HeavyAtomMolWt'](mol_pharm)*0.01]+[1 if mol_pharm.GetRingInfo().NumRings()>0 else 0]+\
+                                [mol_pharm.GetRingInfo().NumRings()]+\
+                                get_PharmElement(mol_pharm)+maccskeys_emb(mol_pharm)
+    except:
+        pharm_feat = [0]*get_pharm_fdim()
+    return pharm_feat
+def brics_features(mol, pretrain=False):
+    fragsmiles = [Chem.MolToSmiles(x, True) for x in Chem.GetMolFrags(BreakBRICSBonds(mol), asMols=True)]
+    break_bonds = [mol.GetBondBetweenAtoms(i[0][0], i[0][1]).GetIdx() for i in FindBRICSBonds(mol)]
+    if break_bonds == []:
+        tmp = mol
+    else:
+        tmp = Chem.FragmentOnBonds(mol, break_bonds, addDummies=False)
+    frags_idx_lst = Chem.GetMolFrags(tmp)
+    pharm_feats = {}
+    atom2pharmid = {}
+    for idx, frag_idx in enumerate(frags_idx_lst):
+        for atom_idx in frag_idx:
+            atom2pharmid[atom_idx] = idx
+        try:
+            frag_pharm = fragsmiles[idx]
+            mol_pharm = Chem.MolFromSmiles(frag_pharm)
+            pharm_feat = GetBRICSFeature(mol_pharm)
+        except:
+            print(f'generate Pharm feature make a error in {Chem.MolToSmiles(mol)}')
+            pharm_feat = [0] * PHARM_FEATURE_SIZE
+        pharm_feats[idx] = pharm_feat
+
+    return pharm_feats, atom2pharmid, frags_idx_lst
+
+with open('./chemprop/data/funcgroup.txt', "r") as f:
+    funcgroups = f.read().strip().split('\n')
+    name = [i.split()[0] for i in funcgroups]
+    smart = [Chem.MolFromSmarts(i.split()[1]) for i in funcgroups]
+    smart2name = dict(zip(smart, name))
+    func2index = {smart2name[sm]:i for i,sm in enumerate(smart)}
+
+def match_group(mol):
+    mapping = []
+    func2atom,mathch_smart2name = [],[]
+    for sm in smart:
+        if mol.HasSubstructMatch(sm):
+            atom_indices = mol.GetSubstructMatch(sm)
+            mapping.extend([func2index[smart2name[sm]]])
+            for atom_lst in [atom_indices]:
+                atom_l = [x+1 for x in list(atom_lst)]
+                if len(atom_l)>15:
+                    atom_l = atom_l[:15]
+                else:
+                    atom_l = atom_l+[0]*(15-len(atom_l))
+                func2atom.extend([atom_l])
+                mathch_smart2name.append(smart2name[sm])
+    return mapping,func2atom,mathch_smart2name
+
+def GetBricsBonds(mol):
+    bonds_tmp = FindBRICSBonds(mol)
+    bonds = [b for b in bonds_tmp]
+    result = {}
+    for item in bonds:# item[0] is atom, item[1] is brics type
+        result.update({(int(item[0][0]), int(item[0][1])):[int(item[1][0]), int(item[1][1])]})
+        result.update({(int(item[0][1]), int(item[0][0])):[int(item[1][1]), int(item[1][0])]})
+    return result
 
 def onek_encoding_unk(value: int, choices: List[int]) -> List[int]:
     """
@@ -87,7 +214,6 @@ def onek_encoding_unk(value: int, choices: List[int]) -> List[int]:
 
     return encoding
 
-
 def atom_features(atom: Chem.rdchem.Atom, functional_groups: List[int] = None) -> List[Union[bool, int, float]]:
     """
     Builds a feature vector for an atom.
@@ -96,6 +222,7 @@ def atom_features(atom: Chem.rdchem.Atom, functional_groups: List[int] = None) -
     :param functional_groups: A k-hot vector indicating the functional groups the atom belongs to.
     :return: A list containing the atom features.
     """
+
     features = onek_encoding_unk(atom.GetAtomicNum() - 1, ATOM_FEATURES['atomic_num']) + \
                onek_encoding_unk(atom.GetTotalDegree(), ATOM_FEATURES['degree']) + \
                onek_encoding_unk(atom.GetFormalCharge(), ATOM_FEATURES['formal_charge']) + \
@@ -132,7 +259,17 @@ def bond_features(bond: Chem.rdchem.Bond) -> List[Union[bool, int, float]]:
         fbond += onek_encoding_unk(int(bond.GetStereo()), list(range(6)))
     return fbond
 
-
+def GetBRICSBondFeature_Hetero(react_1,react_2):
+    result = []
+    start_action_bond = int(react_1) if (react_1 !='7a' and react_1 !='7b') else 7
+    end_action_bond = int(react_2) if (react_2 !='7a' and react_2 !='7b') else 7
+    # return react_features(start_action_bond,end_action_bond)
+    emb_0 = [0 for i in range(17)]
+    emb_1 = [0 for i in range(17)]
+    emb_0[start_action_bond] = 1
+    emb_1[end_action_bond] = 1
+    result = emb_0 + emb_1
+    return result
 class MolGraph:
     """
     A MolGraph represents the graph structure and featurization of a single molecule.
@@ -148,66 +285,120 @@ class MolGraph:
     - b2revb: A mapping from a bond index to the index of the reverse bond.
     """
 
-    def __init__(self, smiles: str, args: Namespace):
+    def __init__(self, smiles: str, args: Namespace, pretrain: bool, brics2emb=None):
         """
         Computes the graph structure and featurization of a molecule.
 
         :param smiles: A smiles string.
         :param args: Arguments.
         """
+        self.brics2emb = brics2emb
         self.smiles = smiles
         self.n_atoms = 0  # number of atoms
         self.n_bonds = 0  # number of bonds
         self.f_atoms = []  # mapping from atom index to atom features
         self.f_bonds = []  # mapping from bond index to concat(in_atom, bond) features
+
+        self.n_real_atoms = 0
+
         self.a2b = []  # mapping from atom index to incoming bond indices
         self.b2a = []  # mapping from bond index to the index of the atom the bond is coming from
         self.b2revb = []  # mapping from bond index to the index of the reverse bond
         self.bonds = []
         # Convert smiles to molecule
         mol = Chem.MolFromSmiles(smiles)
+        self.f_brics, self.atom2pharmid, self.frags_idx_lst = brics_features(mol, pretrain)
+        self.f_brics = list(self.f_brics.values())
+        self.n_brics = len(self.f_brics)
+        self.n_reacts = 0
+        self.f_reacts = []
+        self.p2r = []
+        self.r2p = []
+        self.r2revb = []
+        self.reacts = []
+        self.mapping = []
+        self.func2atom = []
+        self.n_mapping = 0
+        self.n_func2atom = 0
 
-        # fake the number of "atoms" if we are collapsing substructures
-        self.n_atoms = mol.GetNumAtoms()
+        self.smiles_descriptor = []
+        if args.step == 'func_prompt' and 'frag_attention' in args.add_step:
+            self.mapping, self.func2atom, _ = match_group(mol)
+            self.n_mapping = len(self.mapping)
+            self.n_func2atom = len(self.func2atom)
+        self.pretrain = pretrain
+        result = GetBricsBonds(mol)
 
-        # Get atom features
-        for i, atom in enumerate(mol.GetAtoms()):
-            self.f_atoms.append(atom_features(atom))
-        self.f_atoms = [self.f_atoms[i] for i in range(self.n_atoms)]
+        if not self.pretrain:
+            # fake the number of "atoms" if we are collapsing substructures
+            self.n_atoms = mol.GetNumAtoms()
+            # Get atom features
+            for i, atom in enumerate(mol.GetAtoms()):
+                self.f_atoms.append(atom_features(atom))
+            self.f_atoms = [self.f_atoms[i] for i in range(self.n_atoms)]
+            for _ in range(self.n_atoms):
+                self.a2b.append([])
 
-        for _ in range(self.n_atoms):
-            self.a2b.append([])
+            # Get bond features
+            for a1 in range(self.n_atoms):
+                for a2 in range(a1 + 1, self.n_atoms):
+                    bond = mol.GetBondBetweenAtoms(a1, a2)
+                    if bond is None:
+                        continue
+                    f_bond = bond_features(bond)
 
-        # Get bond features
-        for a1 in range(self.n_atoms):
-            for a2 in range(a1 + 1, self.n_atoms):
-                bond = mol.GetBondBetweenAtoms(a1, a2)
+                    if args.atom_messages:
+                        self.f_bonds.append(f_bond)
+                        self.f_bonds.append(f_bond)
+                    else:
+                        self.f_bonds.append(self.f_atoms[a1] + f_bond)
+                        self.f_bonds.append(self.f_atoms[a2] + f_bond)
+                    # Update index mappings
+                    b1 = self.n_bonds
+                    b2 = b1 + 1
+                    self.a2b[a2].append(b1)  # b1 = a1 --> a2
+                    self.b2a.append(a1)
+                    self.a2b[a1].append(b2)  # b2 = a2 --> a1
+                    self.b2a.append(a2)
+                    self.b2revb.append(b2)
+                    self.b2revb.append(b1)
+                    self.n_bonds += 2
+                    self.bonds.append(np.array([a1, a2]))
 
-                if bond is None:
-                    continue
-
-                f_bond = bond_features(bond)
-
-                if args.atom_messages:
-                    self.f_bonds.append(f_bond)
-                    self.f_bonds.append(f_bond)
-                else:
-                    self.f_bonds.append(self.f_atoms[a1] + f_bond)
-                    self.f_bonds.append(self.f_atoms[a2] + f_bond)
-
-                # Update index mappings
-                b1 = self.n_bonds
-                b2 = b1 + 1
-                self.a2b[a2].append(b1)  # b1 = a1 --> a2
-                self.b2a.append(a1)
-                self.a2b[a1].append(b2)  # b2 = a2 --> a1
-                self.b2a.append(a2)
-                self.b2revb.append(b2)
-                self.b2revb.append(b1)
-                self.n_bonds += 2
-                self.bonds.append(np.array([a1, a2]))
-        # rectify a2b
-
+                    # Get pharm features
+            for _ in range(self.n_brics):
+                self.p2r.append([])
+            # Get react features
+            for p1 in range(self.n_brics):
+                for p2 in range(p1 + 1, self.n_brics):
+                    find = False
+                    for a1 in self.frags_idx_lst[p1]:
+                        for a2 in self.frags_idx_lst[p2]:
+                            if (a1, a2) in result:
+                                f_bond1 = GetBRICSBondFeature_Hetero(result[(a1, a2)][0], result[(a1, a2)][1])
+                                f_bond2 = GetBRICSBondFeature_Hetero(result[(a2, a1)][0], result[(a2, a1)][1])
+                                find = True
+                            if find: break
+                        if find: break
+                    if not find:
+                        continue
+                    if args.atom_messages:
+                        self.f_reacts.append(f_bond1)
+                        self.f_reacts.append(f_bond2)
+                    else:
+                        self.f_reacts.append(self.f_brics[p1] + f_bond1)
+                        self.f_reacts.append(self.f_brics[p2] + f_bond2)
+                    # Update index mappings
+                    b1 = self.n_reacts
+                    b2 = b1 + 1
+                    self.p2r[p2].append(b1)  # b1 = p1 --> p2
+                    self.r2p.append(p1)
+                    self.p2r[p1].append(b2)  # b2 = p2 --> p1
+                    self.r2p.append(p2)
+                    self.r2revb.append(b2)
+                    self.r2revb.append(b1)
+                    self.n_reacts += 2
+                    self.reacts.append(np.array([p1, p2]))
 class BatchMolGraph:
     """
     A BatchMolGraph represents the graph structure and featurization of a batch of molecules.
@@ -224,47 +415,105 @@ class BatchMolGraph:
     - a2a: (Optional): A mapping from an atom index to neighboring atom indices.
     """
 
-    def __init__(self, mol_graphs: List[MolGraph], args: Namespace):
+    def __init__(self, mol_graphs, descriptors, args: Namespace):
         self.smiles_batch = [mol_graph.smiles for mol_graph in mol_graphs]
         self.n_mols = len(self.smiles_batch)
 
         self.atom_fdim = get_atom_fdim()
         self.bond_fdim = get_bond_fdim() + (not args.atom_messages) * self.atom_fdim  # * 2
-
+        self.pharm_fdim = get_pharm_fdim()
+        self.react_fdim = get_react_fdim() + (not args.atom_messages) * self.pharm_fdim  # * 2
         # Start n_atoms and n_bonds at 1 b/c zero padding
         self.n_atoms = 1  # number of atoms (start at 1 b/c need index 0 as padding)
         self.n_bonds = 1  # number of bonds (start at 1 b/c need index 0 as padding)
+        self.n_brics = 1
+        self.n_reacts = 1
+        self.n_group = 1
+        self.n_mapping = 0
+        self.n_func2atom = 0
+
+        self.atom_num = []
+        self.brics_num = []
+        self.group_num = []
         self.a_scope = []  # list of tuples indicating (start_atom_index, num_atoms) for each molecule
         self.b_scope = []  # list of tuples indicating (start_bond_index, num_bonds) for each molecule
+        self.brics_scope = []
+        self.react_scope = []
+        self.group_scope = []
+        self.mapping_scope = []
+        self.func2atom_scope = []
 
         # All start with zero padding so that indexing with zero padding returns zeros
         f_atoms = [[0] * self.atom_fdim]  # atom features
         f_bonds = [[0] * self.bond_fdim]  # combined atom/bond features
+        f_brics = [[0] * self.pharm_fdim]  # pharm features
+        f_reacts = [[0] * self.react_fdim]  # combined pharm/react features
+        mapping = []
+        func2atom = []
+
         a2b = [[]]  # mapping from atom index to incoming bond indices
         b2a = [0]  # mapping from bond index to the index of the atom the bond is coming from
         b2revb = [0]  # mapping from bond index to the index of the reverse bond
         bonds = [[0, 0]]
+
+        p2r = [[]]
+        r2p = [0]
+        r2revb = [0]
+        reacts = [[0, 0]]
         for mol_graph in mol_graphs:
             f_atoms.extend(mol_graph.f_atoms)
             f_bonds.extend(mol_graph.f_bonds)
+            f_brics.extend(mol_graph.f_brics)
+            f_reacts.extend(mol_graph.f_reacts)
+            mapping.extend(mol_graph.mapping)
+            func2atom.extend(mol_graph.func2atom)
 
             for a in range(mol_graph.n_atoms):
                 a2b.append([b + self.n_bonds for b in mol_graph.a2b[a]])  # if b!=-1 else 0
+
+            for p in range(mol_graph.n_brics):
+                p2r.append([r + self.n_reacts for r in mol_graph.p2r[p]])
 
             for b in range(mol_graph.n_bonds):
                 b2a.append(self.n_atoms + mol_graph.b2a[b])
                 b2revb.append(self.n_bonds + mol_graph.b2revb[b])
                 bonds.append([b2a[-1],
                               self.n_atoms + mol_graph.b2a[mol_graph.b2revb[b]]])
+
+            for r in range(mol_graph.n_reacts):
+                r2p.append(self.n_brics + mol_graph.r2p[r])
+                r2revb.append(self.n_reacts + mol_graph.r2revb[r])
+                reacts.append([r2p[-1],
+                               self.n_brics + mol_graph.r2p[mol_graph.r2revb[r]]])
+
             self.a_scope.append((self.n_atoms, mol_graph.n_atoms))
             self.b_scope.append((self.n_bonds, mol_graph.n_bonds))
+            self.atom_num.append(mol_graph.n_atoms)
             self.n_atoms += mol_graph.n_atoms
             self.n_bonds += mol_graph.n_bonds
 
+            self.brics_scope.append((self.n_brics, mol_graph.n_brics))
+            self.react_scope.append((self.n_reacts, mol_graph.n_reacts))
+            self.brics_num.append(mol_graph.n_brics)
+            self.n_brics += mol_graph.n_brics
+            self.n_reacts += mol_graph.n_reacts
+
+            # self.group_scope.append((self.n_group,mol_graph.n_group))
+            # self.group_num.append(mol_graph.n_group)
+            # self.n_group += mol_graph.n_group
+
+            self.mapping_scope.append((self.n_mapping, mol_graph.n_mapping))
+            self.n_mapping += mol_graph.n_mapping
+
+            self.func2atom_scope.append((self.n_func2atom, mol_graph.n_func2atom))
+            self.n_func2atom += mol_graph.n_func2atom
+
         bonds = np.array(bonds).transpose(1, 0)
+        reacts = np.array(reacts).transpose(1, 0)
 
         self.max_num_bonds = max(1, max(
             len(in_bonds) for in_bonds in a2b))  # max with 1 to fix a crash in rare case of all single-heavy-atom mols
+        self.max_num_reacts = max(1, max(len(in_bonds) for in_bonds in p2r))
 
         self.f_atoms = torch.FloatTensor(f_atoms)
         self.f_bonds = torch.FloatTensor(f_bonds)
@@ -276,16 +525,31 @@ class BatchMolGraph:
         self.b2b = None  # try to avoid computing b2b b/c O(n_atoms^3)
         self.a2a = None  # only needed if using atom messages
 
-    def get_components(self) -> tuple[
-        FloatTensor, FloatTensor, LongTensor, LongTensor, LongTensor, list[tuple[int, int]], list[
-            tuple[int, int]], LongTensor]:
+        self.f_brics = torch.FloatTensor(f_brics)
+        self.f_reacts = torch.FloatTensor(f_reacts)
+        self.p2r = torch.LongTensor(
+            [p2r[p][:self.max_num_reacts] + [0] * (self.max_num_reacts - len(p2r[p])) for p in range(self.n_brics)])
+        self.r2p = torch.LongTensor(r2p)
+        self.reacts = torch.LongTensor(reacts)
+        self.r2revb = torch.LongTensor(r2revb)
+        self.r2r = None
+        self.p2p = None
+
+        self.descriptors = torch.FloatTensor(descriptors)
+        # self.f_group = torch.FloatTensor(f_group)
+        self.mapping = torch.LongTensor(mapping)
+        self.func2atom = torch.LongTensor(func2atom)
+
+    def get_components(self):
         """
         Returns the components of the BatchMolGraph.
 
         :return: A tuple containing PyTorch tensors with the atom features, bond features, and graph structure
         and two lists indicating the scope of the atoms and bonds (i.e. which molecules they belong to).
         """
-        return self.f_atoms, self.f_bonds, self.a2b, self.b2a, self.b2revb, self.a_scope, self.b_scope, self.bonds
+        return self.f_atoms, self.f_bonds, self.a2b, self.b2a, self.b2revb, self.a_scope, self.atom_num, \
+            self.f_brics, self.f_reacts, self.p2r, self.r2p, self.r2revb, self.brics_scope, self.brics_num, \
+            self.mapping, self.mapping_scope, self.func2atom, self.func2atom_scope, self.descriptors
 
     def get_b2b(self) -> torch.LongTensor:
         """
@@ -317,9 +581,8 @@ class BatchMolGraph:
 
         return self.a2a
 
-
 def mol2graph(smiles_batch: List[str],
-              args: Namespace) -> BatchMolGraph:
+              args: Namespace, pretrain: bool) -> BatchMolGraph:
     """
     Converts a list of SMILES strings to a BatchMolGraph containing the batch of molecular graphs.
 
@@ -327,221 +590,19 @@ def mol2graph(smiles_batch: List[str],
     :param args: Arguments.
     :return: A BatchMolGraph containing the combined molecular graph for the molecules
     """
+    '''if args.step == 'BRICS_prompt' and 'frag_attention' in args.add_step :
+        brics2emb = pickle.load(open(f'./embedding/{args.exp_id}_frag.pkl','rb'))
+    else:'''
+    brics2emb = None
     mol_graphs = []
+    descriptors = []
+    # des = np.load(f"./chemprop/data/{args.exp_id}_descriptor.npy",allow_pickle=True).tolist()
     for smiles in smiles_batch:
-        if smiles in SMILES_TO_GRAPH:
-            mol_graph = SMILES_TO_GRAPH[smiles]
-        else:
-            mol_graph = MolGraph(smiles, args)
-            if not args.no_cache:
-                SMILES_TO_GRAPH[smiles] = mol_graph
+        mol_graph = MolGraph(smiles, args, pretrain, brics2emb)
         mol_graphs.append(mol_graph)
+        # descriptors.append(list(Chem.RDKFingerprint(Chem.MolFromSmiles(smiles), minPath=1, maxPath=7, fpSize=900)))
+    return BatchMolGraph(mol_graphs, descriptors, args)
 
-    return BatchMolGraph(mol_graphs, args)
-
-
-CHARISOSMISET = {"#": 29, "%": 30, ")": 31, "(": 1, "+": 32, "-": 33, "/": 34, ".": 2,
-                 "1": 35, "0": 3, "3": 36, "2": 4, "5": 37, "4": 5, "7": 38, "6": 6,
-                 "9": 39, "8": 7, "=": 40, "A": 41, "@": 8, "C": 42, "B": 9, "E": 43,
-                 "D": 10, "G": 44, "F": 11, "I": 45, "H": 12, "K": 46, "M": 47, "L": 13,
-                 "O": 48, "N": 14, "P": 15, "S": 49, "R": 16, "U": 50, "T": 17, "W": 51,
-                 "V": 18, "Y": 52, "[": 53, "Z": 19, "]": 54, "\\": 20, "a": 55, "c": 56,
-                 "b": 21, "e": 57, "d": 22, "g": 58, "f": 23, "i": 59, "h": 24, "m": 60,
-                 "l": 25, "o": 61, "n": 26, "s": 62, "r": 27, "u": 63, "t": 28, "y": 64, "*": 65}
-def smiles_to_tensor(smiles_batch: List[str]) -> (torch.Tensor, torch.Tensor):
-    """
-    将SMILES批次转换为填充后的索引Tensor和掩码
-
-    参数:
-        smiles_batch: SMILES字符串列表
-        char_to_idx: 字符到索引的映射字典
-
-    返回:
-        (encoded_tensor, mask_tensor)
-        encoded_tensor: 形状为 (batch_size, max_len) 的LongTensor
-        mask_tensor: 形状为 (batch_size, max_len) 的BoolTensor (1表示有效字符)
-    """
-    # 1. 计算最大长度
-    max_len = max(len(smiles) for smiles in smiles_batch)
-
-    # 2. 初始化结果张量
-    batch_size = len(smiles_batch)
-    encoded_tensor = torch.zeros((batch_size, max_len), dtype=torch.long)
-    mask_tensor = torch.zeros((batch_size, max_len), dtype=torch.bool)
-
-    # 3. 填充每个SMILES
-    for i, smiles in enumerate(smiles_batch):
-        # 字符级编码
-        # encoded = [CHARISOSMISET[char] for char in smiles]
-        encoded_tensor[i, :len(smiles)] = torch.tensor([CHARISOSMISET[char] for char in smiles])
-        mask_tensor[i, :len(smiles)] = True  # 有效位置标记为True
-
-    # cls_id = 65
-    #
-    # # 创建 shape 为 [256, 1] 的 CLS token 矩阵
-    # cls_column = torch.full((batch_size, 1), cls_id, dtype=encoded_tensor.dtype, device=encoded_tensor.device)
-    #
-    # # 拼接在前面
-    # output_tensor = torch.cat([cls_column, encoded_tensor], dim=1)
-    #
-    # if mask_tensor.dim() == 2:
-    #     attention_mask = mask_tensor.unsqueeze(1)  # [B, L] → [B, 1, L]
-    #
-    # cls_mask = torch.ones((batch_size, 1, 1), dtype=attention_mask.dtype, device=attention_mask.device)
-    # new_attention_mask = torch.cat([cls_mask, attention_mask], dim=2)  # [B, 1, L+1]
-
-    # return encoded_tensor, attention_mask.squeeze(1), max_len
-    return encoded_tensor, mask_tensor, max_len
-
-func_path = os.path.abspath("./chemprop/data/funcgroup.txt")
-with open(func_path, "r") as f:
-    funcgroups = f.read().strip().split('\n')
-    name = [i.split()[0] for i in funcgroups]
-    smart = [Chem.MolFromSmarts(i.split()[1]) for i in funcgroups]#	list of Mol，SMARTS 对象列表
-    smart2name = dict(zip(smart, name))#字典key:mol对象，value：名称
-    func2index = {smart2name[sm]:i for i,sm in enumerate(smart)}#字典key:官能团名字，value：ID
-
-def match_group(mol):
-    mapping = []#包含的功能团编号
-    func2atom,mathch_smart2name = [],[]#匹配到的原子索引，匹配到的功能团名字
-    for sm in smart:
-        if mol.HasSubstructMatch(sm):
-            atom_indices = mol.GetSubstructMatch(sm)
-            mapping.extend([func2index[smart2name[sm]]])
-            for atom_lst in [atom_indices]:
-                atom_l = [x+1 for x in list(atom_lst)]
-                if len(atom_l)>15:#官能团包含的原子个数为15
-                    atom_l = atom_l[:15]
-                else:
-                    atom_l = atom_l+[0]*(15-len(atom_l))
-                func2atom.extend([atom_l])
-                mathch_smart2name.append(smart2name[sm])
-    return mapping,func2atom,mathch_smart2name
-
-def smiles_batch_to_func(smiles_batch: List[str]) -> tuple[
-    list[tuple[int, int]], list[tuple[int, int]], LongTensor, list[tuple[int, int]], LongTensor]:
-    """
-    处理一个SMILES批次，提取功能团嵌入及索引信息
-
-    参数：
-        smiles_batch: SMILES字符串列表
-
-    返回：
-        a_scope: 原子起始范围（每个分子）
-        mapping_scope: 功能团编号范围（每个分子）
-        func2atom: 所有功能团到原子索引的映射（固定长度15）
-        func2atom_scope: 每个功能团在func2atom中的范围
-    """
-    a_scope = []            # 每个分子的原子范围 (start_idx, length)
-    mapping_scope = []      # 每个分子的功能团编号范围
-    func2atom = []          # 所有官能团到原子的映射
-    func2atom_scope = []    # 每个功能团对应在func2atom中的位置
-    all_mapping = []
-    total_atoms = 1         #number of atoms (start at 1 b/c need index 0 as padding)
-    total_groups = 0
-    total_f2a = 0
-
-    for smi in smiles_batch:
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            raise ValueError(f"Invalid SMILES: {smi}")
-
-        num_atoms = mol.GetNumAtoms()
-        a_scope.append((total_atoms, num_atoms))
-        total_atoms += num_atoms
-
-        # 调用你定义的 match_group 方法
-        mapping, f2a, _ = match_group(mol)
-
-        # 累积 mapping & func2atom
-        all_mapping.extend(mapping)
-        func2atom.extend(f2a)
-
-        num_groups = len(mapping)
-        mapping_scope.append((total_groups, num_groups))
-        n_func2atom = len(f2a)
-        func2atom_scope.append((total_f2a,n_func2atom))  # 每个官能团1个列表
-        total_f2a += n_func2atom
-        total_groups += num_groups
-    all_mapping = torch.LongTensor(all_mapping)
-    func2atom = torch.LongTensor(func2atom)
-
-    return a_scope, mapping_scope, func2atom, func2atom_scope, all_mapping
-
-def get_PharmElement(mol_pharm):
-    atom_symbol={'C':0,'H':0,'O':0,'N':0,'P':0,
-                 'S':0,'F':0,'CL':0,'Br':0,'other':0,}
-    feat_pharm_element =[]
-    # [C,H,O,N,P,S,F,CL,Br,other]
-    for atom in mol_pharm.GetAtoms():
-        if atom.GetSymbol() in atom_symbol.keys():
-            atom_symbol[atom.GetSymbol()]+=1
-        else:
-            atom_symbol['other']+=1
-    for key,value in atom_symbol.items():
-        feat_pharm_element+=[value]
-    return feat_pharm_element
-
-def maccskeys_emb(mol):
-    return list(MACCSkeys.GenMACCSKeys(mol))
-
-def get_pharm_fdim() -> int:
-    return PHARM_FEATURE_SIZE
-
-def GetBRICSFeature(mol_pharm):
-    try:
-        pharm_feat= [calc['TPSA'](mol_pharm)*0.01]+[calc['MolLogP'](mol_pharm)]+\
-                                [calc['HeavyAtomMolWt'](mol_pharm)*0.01]+[1 if mol_pharm.GetRingInfo().NumRings()>0 else 0]+\
-                                [mol_pharm.GetRingInfo().NumRings()]+\
-                                get_PharmElement(mol_pharm)+maccskeys_emb(mol_pharm)
-    except:
-        pharm_feat = [0]*get_pharm_fdim()
-    return pharm_feat
-
-def brics_features(mol, pretrain=False):
-    fragsmiles = [Chem.MolToSmiles(x, True) for x in Chem.GetMolFrags(BreakBRICSBonds(mol), asMols=True)]
-    break_bonds = [mol.GetBondBetweenAtoms(i[0][0], i[0][1]).GetIdx() for i in FindBRICSBonds(mol)]
-    if break_bonds == []:
-        tmp = mol
-    else:
-        tmp = Chem.FragmentOnBonds(mol, break_bonds, addDummies=False)
-    frags_idx_lst = Chem.GetMolFrags(tmp)
-    pharm_feats = {}
-    atom2pharmid = {}
-    for idx, frag_idx in enumerate(frags_idx_lst):
-        for atom_idx in frag_idx:
-            atom2pharmid[atom_idx] = idx
-        try:
-            frag_pharm = fragsmiles[idx]
-            mol_pharm = Chem.MolFromSmiles(frag_pharm)
-            pharm_feat = GetBRICSFeature(mol_pharm)
-        except:
-            print(f'generate Pharm feature make a error in {Chem.MolToSmiles(mol)}')
-            pharm_feat = [0] * PHARM_FEATURE_SIZE
-        pharm_feats[idx] = pharm_feat
-
-    return pharm_feats, atom2pharmid, frags_idx_lst
-
-def GetBricsBonds(mol):
-    bonds_tmp = FindBRICSBonds(mol)
-    bonds = [b for b in bonds_tmp]
-    result = {}
-    for item in bonds:# item[0] is atom, item[1] is brics type
-        result.update({(int(item[0][0]), int(item[0][1])):[int(item[1][0]), int(item[1][1])]})
-        result.update({(int(item[0][1]), int(item[0][0])):[int(item[1][1]), int(item[1][0])]})
-    return result
-
-def GetBRICSBondFeature_Hetero(react_1,react_2):
-    result = []
-    start_action_bond = int(react_1) if (react_1 !='7a' and react_1 !='7b') else 7
-    end_action_bond = int(react_2) if (react_2 !='7a' and react_2 !='7b') else 7
-    # return react_features(start_action_bond,end_action_bond)
-    emb_0 = [0 for i in range(17)]
-    emb_1 = [0 for i in range(17)]
-    emb_0[start_action_bond] = 1
-    emb_1[end_action_bond] = 1
-    result = emb_0 + emb_1
-    return result
 
 def Mol2HeteroGraph(mol, args: Namespace):
     # build graphs
