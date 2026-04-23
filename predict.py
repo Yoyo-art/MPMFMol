@@ -44,7 +44,7 @@ if __name__ == '__main__':
     args.runs = 2
     args.encoder = False
     args.exp_name = "finetune"
-    args.checkpoint_path = "./original_MoleculeModel.pkl"
+    args.checkpoint_path = "./ckpt/original_MoleculeModel.pkl"
     args.gpu = 0
     args.epochs = 100
     args.pretrain = False
