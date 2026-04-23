@@ -60,20 +60,20 @@ class Prompt_generator(nn.Module):
         self.lr = nn.Linear(self.hidden_size*3,self.hidden_size)
         self.norm = nn.LayerNorm(args.hidden_size)
     def forward(self, f_atom, atom_scope, f_group, group_scope, mapping, mapping_scope):
-        max_frag_size = max([g_size for _,g_size in group_scope])+1 # 加上一行填充位置
+        max_frag_size = max([g_size for _,g_size in group_scope])+1 
         f_frag_list = []
         padding_zero = torch.zeros((1,self.hidden_size)).cuda()
-        for i,(g_start, g_size) in enumerate(group_scope):#每个分子包含官能团的起始范围
-            a_start,a_size = atom_scope[i]#每个分子包含原子的起始范围
-            m_start,m_size = mapping_scope[i]#每个分子官能团到原子索引的起始范围
-            cur_a = f_atom.narrow(0,a_start,a_size)#当前分子的原子特征
-            cur_g = f_group.narrow(0,g_start,g_size)#功能团嵌入
-            cur_m = mapping.narrow(0,m_start,m_size) #映射关系
-            cur_a = torch.cat([padding_zero,cur_a],dim=0) #将原子特征填充到index=0
-            cur_a = cur_a[cur_m]#从f_atom中提取与官能团对应的原子特征
-            cur_g = torch.cat([cur_a.sum(dim=1),cur_a.max(dim=1)[0],cur_g],dim=1)#构建每个官能团表示
-            cur_brics = torch.cat([self.fg,cur_g],dim=0)#添加全局提示
-            cur_frage = torch.nn.ZeroPad2d((0,0,0,max_frag_size-cur_brics.shape[0]))(cur_brics)#分子官能团个数补齐
+        for i,(g_start, g_size) in enumerate(group_scope):
+            a_start,a_size = atom_scope[i]
+            m_start,m_size = mapping_scope[i]
+            cur_a = f_atom.narrow(0,a_start,a_size)
+            cur_g = f_group.narrow(0,g_start,g_size)
+            cur_m = mapping.narrow(0,m_start,m_size) 
+            cur_a = torch.cat([padding_zero,cur_a],dim=0) 
+            cur_a = cur_a[cur_m]
+            cur_g = torch.cat([cur_a.sum(dim=1),cur_a.max(dim=1)[0],cur_g],dim=1)
+            cur_brics = torch.cat([self.fg,cur_g],dim=0)
+            cur_frage = torch.nn.ZeroPad2d((0,0,0,max_frag_size-cur_brics.shape[0]))(cur_brics)
             f_frag_list.append(cur_frage.unsqueeze(0))
         f_frag_list = torch.cat(f_frag_list, 0)
         f_frag_list = self.act_func(self.lr(f_frag_list))
