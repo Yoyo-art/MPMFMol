@@ -40,11 +40,11 @@ if __name__ == '__main__':
     args.root_path = "./data"
     args.metric = "auc"#rmse,auc
     args.dataset_type = "classification"#regression,classification
-    args.split_type = "scaffold_balanced"# scaffold_balanced
+    args.split_type = "scaffold_balanced"
     args.runs = 2
     args.encoder = False
     args.exp_name = "finetune"
-    # args.checkpoint_path = "./ckpt/original_MoleculeModel.pkl"
+    args.checkpoint_path = "./ckpt/original_MoleculeModel.pkl"
     args.gpu = 0
     args.epochs = 100
     args.pretrain = False
