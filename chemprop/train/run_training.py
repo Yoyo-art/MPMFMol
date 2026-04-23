@@ -299,7 +299,7 @@ def pre_training(args: Namespace, logger: Logger = None) -> List[float]:
 
     # Get data
     debug('Loading data')
-    data = get_pre_data(path=args.data_path, args=args, logger=logger)
+    data = get_data(path=args.data_path, args=args, logger=logger)
 
     args.data_size = len(data)
 
@@ -309,7 +309,7 @@ def pre_training(args: Namespace, logger: Logger = None) -> List[float]:
     for model_idx in range(args.ensemble_size):
         # Tensorboard writer
         save_dir = os.path.join(args.save_dir, f'model_{model_idx}')
-        makedirs(save_dir)
+        os.makedirs(save_dir)
         # Load/build model
         if args.checkpoint_paths is not None:
             debug(f'Loading model {model_idx} from {args.checkpoint_paths[model_idx]}')
@@ -337,14 +337,13 @@ def pre_training(args: Namespace, logger: Logger = None) -> List[float]:
         # logger, dump_folder = initialize_exp(Namespace(**args.__dict__))
         dump_folder = f'{args.save_dir}/model'
 
-        # device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
-        # args.device = device
+        criterion = ContrastiveLoss(loss_computer='nce_softmax', temperature=args.temperature, args=args).cuda()
         criterion1 = torch.nn.CrossEntropyLoss().cuda()
-        optimizer = Adam([{"params": model1.parameters()}, {"params": model2.parameters()}], lr=3e-5)
+        optimizer = Adam([{"params": model1.parameters()}, {"params": model2.parameters()}], lr=1e-3)
         scheduler = ExponentialLR(optimizer, 0.99, -1)
         step_per_schedule = 500
         global_step = 0
-        mol = pre_MoleculeDataset(data)
+        mol = MoleculeDataset(data)
         smiles, features = mol.smiles(), mol.features()
         y1, y2, y3 = mol.y1(), mol.y2(), mol.y3()
         train_size = int(0.98 * len(smiles))
@@ -368,7 +367,7 @@ def pre_training(args: Namespace, logger: Logger = None) -> List[float]:
             debug = logger.debug if logger is not None else print
             total_loss = 0
             step = 'pretrain'
-            with tqdm(total=len(train_loader)) as t:
+            with tqdm(total=len(train_loader), ncols=200) as t:
                 for batch in train_loader:
                     smiles_batch, y1_batch, y2_batch, y3_batch = batch
                     model1.train()
@@ -376,21 +375,37 @@ def pre_training(args: Namespace, logger: Logger = None) -> List[float]:
                     # Run model
                     emb1, p1, p2, p3 = model1(step, False, list(smiles_batch), None)  # Original graph
                     emb2, _, _, _ = model2(step, True, list(smiles_batch), None)  # Augmented graph
-                    class_loss1 = criterion1(p1, torch.tensor(y1_batch).to(p1.device))
-                    class_loss2 = criterion1(p2, torch.tensor(y2_batch).to(p1.device))
-                    class_loss3 = criterion1(p3, torch.tensor(y3_batch).to(p1.device))
+                    y1 = torch.tensor(y1_batch, dtype=torch.long).to(p1.device)
+                    y2 = torch.tensor(y2_batch, dtype=torch.long).to(p1.device)
+                    y3 = torch.tensor(y3_batch, dtype=torch.long).to(p1.device)
+                    class_loss1 = criterion1(p1, y1)
+                    class_loss2 = criterion1(p2, y2)
+                    class_loss3 = criterion1(p3, y3)
+                    pred = p1.argmax(dim=1)
+                    acc = (pred == y1).float().mean()
                     c1 = class_loss1 / math.log(100)
                     c2 = class_loss2 / math.log(1000)
                     c3 = class_loss3 / math.log(10000)
-                    class_loss = c1 + c2 + c3
-                    loss_dist = (emb1 - emb2).pow(2).sum(axis=1).sqrt().mean()
+                    class_loss = c1 * 10 + c2 * 5 + c3 * 2
+                    sim_loss = F.mse_loss(emb1, emb2)
+                    std_emb1 = torch.sqrt(emb1.var(dim=0) + 1e-04)
+                    std_emb2 = torch.sqrt(emb2.var(dim=0) + 1e-04)
+                    var_loss = torch.mean(F.relu(1.0 - std_emb1)) + torch.mean(F.relu(1.0 - std_emb2))
+                    loss_dist = sim_loss + 1.0 * var_loss
                     loss = loss_dist + class_loss
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
                     global_step += 1
                     t.set_description('Epoch[{}/{}]'.format(epoch + 1, args.end_epochs))
-                    t.set_postfix(train_loss=loss.item())
+                    t.set_postfix(
+                        train_loss=f"{loss.item():.4f}",
+                        cls_loss=f"{class_loss.item():.4f}",
+                        dist_loss=f"{loss_dist.item():.4f}",
+                        sim_loss=f"{sim_loss.item():.4f}",
+                        acc=f"{acc.item():.4f}",
+                        var_loss=f"{var_loss.item():.4f}"
+                    )
                     t.update()
                     total_loss += loss.item()
                     if global_step % step_per_schedule == 0:
@@ -404,16 +419,16 @@ def pre_training(args: Namespace, logger: Logger = None) -> List[float]:
                 with torch.no_grad():
                     emb1, p1, p2, p3 = model1(step, False, smiles_batch, None)  # Original graph
                     emb2, _, _, _ = model2(step, True, smiles_batch, None)  # Augmented graph
-                    class_loss1 = criterion1(p1, torch.tensor(y1_batch).to(p1.device))
-                    class_loss2 = criterion1(p2, torch.tensor(y2_batch).to(p1.device))
-                    class_loss3 = criterion1(p3, torch.tensor(y3_batch).to(p1.device))
-                    c1 = class_loss1 / math.log(100)
-                    c2 = class_loss2 / math.log(1000)
-                    c3 = class_loss3 / math.log(10000)
-                    class_loss = c1 + c2 + c3
-                    loss_dist = (emb1 - emb2).pow(2).sum(axis=1).sqrt().mean()
-                    loss = loss_dist + class_loss
-                    total_test_loss += loss.item()
+                    sim_loss = F.mse_loss(emb1, emb2)
+                    std_emb1 = torch.sqrt(emb1.var(dim=0) + 1e-04)
+                    std_emb2 = torch.sqrt(emb2.var(dim=0) + 1e-04)
+                    var_loss = torch.mean(F.relu(1.0 - std_emb1)) + torch.mean(F.relu(1.0 - std_emb2))
+                    loss_dist = sim_loss + 1.0 * var_loss
+                    class_loss1 = criterion1(p1, torch.tensor(y1_batch).to(p1.device)) / math.log(100)
+                    class_loss2 = criterion1(p2, torch.tensor(y2_batch).to(p1.device)) / math.log(1000)
+                    class_loss3 = criterion1(p3, torch.tensor(y3_batch).to(p1.device)) / math.log(10000)
+                    lo = loss_dist + 10 * class_loss1 + 5 * class_loss2 + 2 * class_loss3
+                    total_test_loss += lo.item()
             logger.info(f'{global_step} test loss {total_test_loss / len(test_loader):.4f}')
             snapshot(model1, epoch, dump_folder, 'original')
             snapshot(model2, epoch, dump_folder, 'augment')
